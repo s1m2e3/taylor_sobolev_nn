@@ -1,20 +1,20 @@
 import torch 
 from taylor_sobolev_utils import estimate_gradient
 
-def train(big_model,small_model,x_train_tensor,y_train,x_valid_tensor,y_valid,batch_size,epochs,lr):
+def train(big_model,small_model,x_train,y_train,x_valid,y_valid,batch_size=64,epochs=1e3,lr=1e-3):
     
     # Create DataLoader instances
-    train_dataset = torch.utils.data.TensorDataset(x_train_tensor, y_train)
+    train_dataset = torch.utils.data.TensorDataset(x_train, y_train)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    valid_dataset = torch.utils.data.TensorDataset(x_valid_tensor, y_valid)
+    valid_dataset = torch.utils.data.TensorDataset(x_valid, y_valid)
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
 
     optimizer = torch.optim.Adam(small_model.parameters(), lr=lr)
     criterion_ce = torch.nn.CrossEntropyLoss()
     mse_point = torch.nn.MSELoss()
     mse_grad = torch.nn.MSELoss()
-    for epoch in range(epochs):
+    for epoch in range(int(epochs)):
         
         small_model.train()  # Set the combined model to training mode
         
@@ -22,12 +22,19 @@ def train(big_model,small_model,x_train_tensor,y_train,x_valid_tensor,y_valid,ba
             # Zero the parameter gradients
             optimizer.zero_grad()           
             outputs = small_model(inputs)
+            
+            # Temporarily set models to eval mode for jvp, which requires a pure function
+            small_model.eval()
+            big_model.eval()
             v = torch.randn_like(inputs,dtype=torch.float32,)
-            _,output_gradients = estimate_gradient(small_model,inputs,inputs+v)
+            _,output_gradients = estimate_gradient(small_model,inputs,v) # Corrected displacement
             with torch.no_grad():
-                outputs_big_model = big_model(inputs)
-                _,output_gradients_big_model = estimate_gradient(big_model,inputs,inputs+v)
-            loss = criterion_ce(outputs, labels_full)+mse_point(outputs,outputs_big_model)+mse_grad(output_gradients,output_gradients_big_model)
+                inputs_permuted = inputs.permute(0, 3, 1, 2)
+                outputs_big_model = big_model(inputs_permuted)
+                _,output_gradients_big_model = estimate_gradient(big_model,inputs_permuted,v.permute(0, 3, 1, 2)) # Corrected displacement
+            # Return small_model to training mode for loss.backward()
+            small_model.train()
+            loss = criterion_ce(outputs, labels_full.squeeze())+mse_point(outputs,outputs_big_model)+mse_grad(output_gradients,output_gradients_big_model)
 
             # Backward pass and optimize
             loss.backward()
@@ -50,17 +57,21 @@ def train(big_model,small_model,x_train_tensor,y_train,x_valid_tensor,y_valid,ba
                 # Generate a random displacement for gradient estimation
                 # This 'v' should ideally be consistent for a given input across models for a fair comparison
                 # but for validation, regenerating per batch is acceptable.
-                v = torch.randn_like(inputs, dtype=torch.float32)
+                v_valid = torch.randn_like(inputs, dtype=torch.float32) # Use a different variable name for clarity
                 
+                # Models are already in eval mode here, which is what estimate_gradient needs.
+                # No mode change is necessary within the validation loop.
+
                 # Estimate gradients for the small model
-                _, output_gradients = estimate_gradient(small_model, inputs, inputs + v)
+                _, output_gradients = estimate_gradient(small_model, inputs, v_valid) # Corrected displacement
                 
                 # Estimate outputs and gradients for the big model (no_grad already active)
-                outputs_big_model = big_model(inputs)
-                _, output_gradients_big_model = estimate_gradient(big_model, inputs, inputs + v)
-                
+                inputs_permuted = inputs.permute(0, 3, 1, 2)
+                outputs_big_model = big_model(inputs_permuted)
+                _, output_gradients_big_model = estimate_gradient(big_model, inputs_permuted, v_valid.permute(0, 3, 1, 2)) # Corrected displacement
+
                 # Calculate validation loss
-                valid_loss = criterion_ce(outputs, labels_full) + mse_point(outputs, outputs_big_model) + mse_grad(output_gradients, output_gradients_big_model)
+                valid_loss = criterion_ce(outputs, labels_full.squeeze()) + mse_point(outputs, outputs_big_model) + mse_grad(output_gradients, output_gradients_big_model)
                 total_valid_loss += valid_loss.item()
         
         avg_valid_loss = total_valid_loss / len(valid_loader)

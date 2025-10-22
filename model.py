@@ -37,7 +37,7 @@ class model(nn.Module):
         x = self.pool1(F.relu(self.bn1(self.conv1(x))))
         x = self.pool2(F.relu(self.bn2(self.conv2(x))))
         x = self.pool3(F.relu(self.bn3(self.conv3(x))))
-        x = x.view(-1, 128 * 4 * 4) # Flatten the tensor
+        x = x.reshape(-1, 128 * 4 * 4) # Flatten the tensor
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
