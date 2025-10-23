@@ -19,7 +19,7 @@ class CifarDataset(Dataset):
 
         return img, target
 
-def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, batch_size=16,epochs=10,lr=1e-3, jvp_weight = 0.1, distil_weight = 0.5, T = 2.0):
+def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, batch_size=32,epochs=100,lr=1e-3, jvp_weight = 0.5, distil_weight = 1, T = 2.0):
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -30,7 +30,7 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
     valid_dataset = CifarDataset(x_valid, y_valid, transform=preprocess)
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
 
-    optimizer = torch.optim.Adam(small_model.parameters(), lr=lr)
+    optimizer = torch.optim.SGD(small_model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
     criterion_ce = torch.nn.CrossEntropyLoss()
     mse_point = torch.nn.MSELoss()
     mse_grad = torch.nn.MSELoss()
@@ -57,7 +57,7 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
                 _,output_gradients_big_model = estimate_gradient(big_model,inputs_nchw,v) # Corrected displacement
             # Return small_model to training mode for loss.backward()
             small_model.train()
-            ce_loss = criterion_ce(outputs, labels_full.squeeze())
+            ce_loss = criterion_ce(outputs_ce, labels_full.squeeze())
             loss = ce_loss+distil_weight*(T*T)*kd(torch.log_softmax(outputs / T, dim=1),torch.softmax(outputs_big_model / T, dim=1))\
                 +jvp_weight*mse_grad(output_gradients,output_gradients_big_model)
 
@@ -82,6 +82,7 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
                 
                 # Calculate validation loss
                 valid_loss = criterion_ce(outputs, labels_full.squeeze())
+                print(valid_loss.item())
                 total_valid_loss += valid_loss.item()
         
         avg_valid_loss = total_valid_loss / len(valid_loader)
