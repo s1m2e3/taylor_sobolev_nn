@@ -43,3 +43,30 @@ def estimate_gradient(module,x0,displacement):
     # Call jvp with the functional forward pass
     primal_output, jvp_output = torch.func.jvp(functional_forward_for_jvp, (params, float_buffers, x0), (tangent_params, tangent_buffers, displacement))
     return primal_output, jvp_output
+
+def get_jacobian(module, x):
+    """Computes the Jacobian of the module's output with respect to the input x.
+
+    This function uses torch.func.jacrev to compute the Jacobian. It is memory-
+    intensive and should be used on a single sample or a very small batch.
+
+    Args:
+        module (torch.nn.Module or callable): The model or function.
+        x (torch.Tensor): The point at which to compute the Jacobian.
+            Typically a single sample (e.g., shape [C, H, W]). For batches,
+            consider using vmap.
+
+    Returns:
+        torch.Tensor: The Jacobian of module(x) with respect to x.
+    """
+    params = dict(module.named_parameters())
+    buffers = dict(module.named_buffers())
+
+    def functional_forward(p, b, data):
+        # Use functional_call to run the module with specific params and buffers
+        return torch.func.functional_call(module, (p, b), data)
+
+    # jacrev computes the Jacobian of functional_forward with respect to its `argnums`-th argument.
+    # We want to differentiate with respect to `data`, which is the 2nd argument (0-indexed).
+    jacobian = torch.func.jacrev(functional_forward, argnums=2)(params, buffers, x)
+    return jacobian
