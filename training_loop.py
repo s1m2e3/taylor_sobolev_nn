@@ -19,7 +19,7 @@ class CifarDataset(Dataset):
 
         return img, target
 
-def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, batch_size=50,epochs=100,lr=1e-3, weight_decay=5e-4, entropy_weight=0.1, jvp_weight = 0.05, distil_weight = 0.1, T = 2.0, num_samples_random=4):
+def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, batch_size=50,epochs=100,lr=1e-3, weight_decay=5e-4, entropy_weight=0.25, jvp_weight = 0.1, distil_weight = 1.0, T = 1.0, num_samples_random=4):
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -56,7 +56,7 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
             ce_loss = criterion_ce(outputs_ce, labels_full.squeeze())
             jvp_small = []
             jvp_large = []
-            if epoch >10 and epoch%2 ==0:
+            if epoch >10 and i%2==0:
                 with torch.no_grad():
                     outputs_big_model = big_model(inputs_nchw)
                     for _ in range(num_samples_random):
