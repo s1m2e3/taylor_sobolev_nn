@@ -2,6 +2,7 @@ import torch
 from taylor_sobolev_utils import estimate_gradient, get_jacobian
 from PIL import Image
 from torch.utils.data import Dataset
+import json, os
 class CifarDataset(Dataset):
     def __init__(self, data, targets, transform):
         self.data = data
@@ -23,7 +24,7 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    # Create DataLoader instances
+    # Create DataLoader instances.
     train_dataset = CifarDataset(x_train, y_train, transform=preprocess)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
@@ -36,7 +37,27 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
     mse_grad = torch.nn.MSELoss()
     kd = torch.nn.KLDivLoss(reduction="batchmean")
 
-    for epoch in range(int(epochs)):        
+
+    # 0) Define the helper once near the top of your script
+
+    def log_epoch_jsonl(epoch, training_loss, validation_loss, train_avg_entropy):
+        path="logs/metrics.jsonl"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        rec = {
+            "epoch": {
+                "id": int(epoch),
+                "training_loss": float(training_loss),
+                "validation_loss": float(validation_loss),
+                "train_avg_entropy": float(train_avg_entropy)
+            }
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    for epoch in range(int(epochs)):
+        sum_loss = 0.0
+        num_batches = 0 
+        entropy_sum = 0.0  #newR 
         
         for i, (inputs, labels_full) in enumerate(train_loader):
             inputs = inputs.to(device)
@@ -73,16 +94,39 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
                 jvp_large = torch.stack(jvp_large)
                 loss = ce_loss + distil_weight*(T*T)*kd(torch.log_softmax(outputs_ce / T, dim=1),torch.softmax(outputs_big_model / T, dim=1))\
                        + jvp_weight*mse_grad(jvp_small,jvp_large) + entropy_weight * entropy_loss
+                with torch.no_grad():       
+                    preds = outputs_ce.argmax(dim=1)
+                    y_flat = labels_full.view(-1)   # 1-D targets
+                    correct = (preds == y_flat).sum().item()
+                    n = y_flat.numel()
+                    batch_acc = correct / n
                 if i%2==0:
-                    print(f"Combined Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {ce_loss.item():.4f}")
+                    print(f"Combined Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {ce_loss.item():.4f},Acc: {correct}/{n} ({batch_acc:.3f})")
             else:
                 loss = ce_loss + entropy_weight * entropy_loss
+                with torch.no_grad():
+                    preds = outputs_ce.argmax(dim=1)
+                    y_flat = labels_full.view(-1)
+                    correct = (preds == y_flat).sum().item()
+                    n = y_flat.numel()
+                    batch_acc = correct / n
                  # Display loss at each step (or every few steps)
                 if (i + 1) % 10 == 0: # Print every 10 mini-batches
-                    print(f"Combined Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {ce_loss.item():.4f}")
+                    print(f"Combined Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {ce_loss.item():.4f},Acc: {correct}/{n} ({batch_acc:.3f})")
             # Backward pass and optimize
             loss.backward()
             optimizer.step()
+
+            sum_loss += float(loss.item())
+            entropy_sum += float(entropy_loss.item()) #newR
+            num_batches += 1
+
+
+            
+            
+
+        
+        training_loss = sum_loss / max(1, num_batches)
 
         # Validation phase
         small_model.eval()  # Set the small model to evaluation mode
@@ -100,6 +144,9 @@ def train(big_model,small_model,x_train,y_train,x_valid,y_valid, preprocess, bat
                 total_valid_loss += valid_loss.item()
         
         avg_valid_loss = total_valid_loss / len(valid_loader)
-        print(f"Epoch [{epoch+1}/{epochs}], Validation Loss: {avg_valid_loss:.4f}")
+        avg_train_entropy = entropy_sum / max(1, num_batches)#newR
+        log_epoch_jsonl(epoch + 1, training_loss, avg_valid_loss, avg_train_entropy)#newR
+        print(f"Epoch [{epoch+1}/{epochs}], Validation Loss: {avg_valid_loss:.4f}, Average Entropy: {float(avg_train_entropy)}")#newR
 
     return small_model
+
