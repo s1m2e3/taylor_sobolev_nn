@@ -1,72 +1,78 @@
+# taylor_sobolev_utils.py
+
+import contextlib
 import torch
-import torch.func
-def estimate_gradient(module,x0,displacement):
-    """Estimates the directional derivative of a module's output.
+from torch.autograd.functional import jvp as _jvp, jacobian as _jacobian
 
-    This function computes the Jacobian-vector product (JVP) of the `module` at
-    a given point `x0` in the direction of `displacement`. The JVP is equivalent
-    to the directional derivative of the function represented by the module.
+try:
+    # Optional import: if FSDP isn't available in your build, this still works for plain modules
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    _HAS_FSDP = True
+except Exception:
+    FSDP = None
+    _HAS_FSDP = False
 
-    Args:
-        module (torch.nn.Module or callable): The model or function to differentiate.
-            It should accept a tensor `x0` and return a tensor.
-        x0 (torch.Tensor): The point at which to compute the JVP. This is the
-            primal input to the module.
-        displacement (torch.Tensor): The direction vector for the directional
-            derivative. This is the tangent vector `v` in `Jv`.
 
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The output of `module(x0)`.
-            - The Jacobian-vector product.
+def _is_fsdp(module) -> bool:
+    return _HAS_FSDP and isinstance(module, FSDP)
+
+
+def _inner_module(module):
     """
-    # Get the parameters and buffers of the module for functional_call
-    params = dict(module.named_parameters())
-    all_buffers = dict(module.named_buffers())
-
-    # jvp requires primals to be floating-point. Filter out non-float buffers.
-    # The functional_call inside the lambda will still see all_buffers from the closure.
-    float_buffers = {name: b for name, b in all_buffers.items() if b.is_floating_point()}
-
-    # Define a functional forward pass that takes params, buffers, and input
-    # This function will be passed to torch.func.jvp
-    def functional_forward_for_jvp(params, float_buffers, x_input):
-        # functional_call returns (output, updated_buffers)
-        # We only need the output for the JVP calculation.
-        output = torch.func.functional_call(module, (params, all_buffers), x_input)
-        return output
-
-    # Create zero tangents for parameters and buffers as we are only differentiating w.r.t. x_input
-    tangent_params = {name: torch.zeros_like(p) for name, p in params.items()} # No tangent for params
-    tangent_buffers = {name: torch.zeros_like(b) for name, b in float_buffers.items()} # No tangent for buffers
-
-    # Call jvp with the functional forward pass
-    primal_output, jvp_output = torch.func.jvp(functional_forward_for_jvp, (params, float_buffers, x0), (tangent_params, tangent_buffers, displacement))
-    return primal_output, jvp_output
-
-def get_jacobian(module, x):
-    """Computes the Jacobian of the module's output with respect to the input x.
-
-    This function uses torch.func.jacrev to compute the Jacobian. It is memory-
-    intensive and should be used on a single sample or a very small batch.
-
-    Args:
-        module (torch.nn.Module or callable): The model or function.
-        x (torch.Tensor): The point at which to compute the Jacobian.
-            Typically a single sample (e.g., shape [C, H, W]). For batches,
-            consider using vmap.
-
-    Returns:
-        torch.Tensor: The Jacobian of module(x) with respect to x.
+    For FSDP modules, return the wrapped nn.Module; otherwise return the module itself.
     """
-    params = dict(module.named_parameters())
-    buffers = dict(module.named_buffers())
+    return getattr(module, "_fsdp_wrapped_module", module)
 
-    def functional_forward(p, b, data):
-        # Use functional_call to run the module with specific params and buffers
-        return torch.func.functional_call(module, (p, b), data)
 
-    # jacrev computes the Jacobian of functional_forward with respect to its `argnums`-th argument.
-    # We want to differentiate with respect to `data`, which is the 2nd argument (0-indexed).
-    jacobian = torch.func.jacrev(functional_forward, argnums=2)(params, buffers, x)
-    return jacobian
+@contextlib.contextmanager
+def _maybe_summon_full_params(module):
+    """
+    If module is FSDP, temporarily gather/unflatten params for functional calls.
+    Otherwise, a no-op context manager.
+    """
+    if _is_fsdp(module):
+        # writeback=False so we don't accidentally modify/shard new tensors
+        with FSDP.summon_full_params(module, recurse=True, writeback=False):
+            yield
+    else:
+        yield
+
+
+def estimate_gradient(module: torch.nn.Module,
+                      x0: torch.Tensor,
+                      displacement: torch.Tensor):
+    """
+    Compute (f(x0), J_x0 · v) where f is the module's forward, using forward-mode AD.
+    - Works with plain nn.Module and FSDP-wrapped modules.
+    - Differentiates w.r.t. input only (not params).
+    """
+    # Ensure tangent matches input dtype/device to avoid AMP/dtype mismatches
+    v = displacement.to(dtype=x0.dtype, device=x0.device)
+
+    inner = _inner_module(module)
+
+    def f(inp: torch.Tensor):
+        # Call the inner model directly (handles both plain and FSDP-wrapped)
+        return inner(inp)
+
+    with _maybe_summon_full_params(module):
+        # strict=False tolerates non-differentiable bits in closures; create_graph=False saves memory
+        y, j = _jvp(f, (x0,), (v,), create_graph=False, strict=False)
+
+    return y, j
+
+
+def get_jacobian(module: torch.nn.Module, x: torch.Tensor):
+    """
+    Compute the Jacobian of module(x) w.r.t. x.
+    NOTE: Extremely memory-heavy; prefer JVPs in training loops.
+    """
+    inner = _inner_module(module)
+
+    def f(inp: torch.Tensor):
+        return inner(inp)
+
+    with _maybe_summon_full_params(module):
+        J = _jacobian(f, x, create_graph=False, strict=False)
+
+    return J
